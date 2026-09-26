@@ -17,6 +17,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"pansou/util"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -32,11 +33,14 @@ import (
 	"pansou/util/json"
 )
 
+// DefaultBaseURL 是站点根地址。声明为变量而非常量，是为了让测试能指向本地假服务器，
+// 从而验证重试与中止语义，而不是只能靠肉眼看代码。
+var DefaultBaseURL = "https://pinglian.lol"
+
 const (
 	PluginName        = "panlian"
 	DisplayName       = "盘链"
 	Description       = "盘链 - 登录后检索影视资源并聚合网盘链接"
-	DefaultBaseURL    = "https://pinglian.lol"
 	ConfigFileName    = "panlian_config.json"
 	RequestTimeout    = 20 * time.Second
 	MaxConcurrentJobs = 4
@@ -470,17 +474,22 @@ type VideoSearchResponse struct {
 }
 
 type VideoItem struct {
-	ID          int    `json:"id"`
-	Title       string `json:"title"`
-	Alias       string `json:"alias"`
-	Cover       string `json:"cover"`
-	Intro       string `json:"intro"`
-	Year        string `json:"year"`
-	Area        string `json:"area"`
-	Lang        string `json:"lang"`
-	Remarks     string `json:"remarks"`
-	Score       string `json:"score"`
-	Type        string `json:"type_name"`
+	ID      int    `json:"id"`
+	Title   string `json:"title"`
+	Alias   string `json:"alias"`
+	Cover   string `json:"cover"`
+	Intro   string `json:"intro"`
+	Year    string `json:"year"`
+	Area    string `json:"area"`
+	Lang    string `json:"lang"`
+	Remarks string `json:"remarks"`
+	Score   string `json:"score"`
+	// 注意：这里必须是 "type" 而不是 "type_name"。
+	// 同层出现两个相同的 json tag 时，encoding/json 与本项目实际使用的 sonic
+	// （pansou/util/json）行为一致：**两个字段全部忽略且不报错**（实测确认，
+	// 见 panlian_jsontag_test.go）。于是接口返回的 type_name 谁也没接住，
+	// 下面 normalize 里的 firstNonEmpty(TypeName, Type) 也就永远落空。
+	Type        string `json:"type"`
 	Actor       string `json:"actor"`
 	DirectorNew string `json:"director"`
 
@@ -665,7 +674,7 @@ func (p *PanlianPlugin) searchWithUser(client *http.Client, user *User, keyword 
 	results, err := p.searchOnce(client, user, keyword)
 	if err == nil {
 		user.LastAccessAt = time.Now()
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 		return results, nil
 	}
 
@@ -675,7 +684,7 @@ func (p *PanlianPlugin) searchWithUser(client *http.Client, user *User, keyword 
 	if user.EncryptedPassword == "" || user.Username == "" {
 		user.Status = "expired"
 		user.Cookie = ""
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 		return nil, err
 	}
 
@@ -1261,14 +1270,25 @@ func (p *PanlianPlugin) doJSONGET(client *http.Client, cookie string, path strin
 		targetURL += "?" + values.Encode()
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	var ok bool
+
+	// 重试逻辑收敛到 util.DoWithRetry。这处有两类"重试没有意义"的错误，用 util.Abort 中止：
+	// 登录失效（cookie 过期，再试还是失效）与响应格式不对（再试还是不对）。
+	// 退避是**线性**的（(attempt+1) × 200ms），用 DelayFunc 原样表达。
+	err := util.DoWithRetry(util.RetryConfig{
+		Attempts: 3,
+		DelayFunc: func(attempt int) time.Duration {
+			return time.Duration(attempt+1) * 200 * time.Millisecond
+		},
+	}, func(_ int) error {
 		ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+		defer cancel()
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if err != nil {
-			cancel()
-			return err
+			return util.Abort(err) // 建请求就失败，重试没意义
 		}
+
 		req.Header.Set("User-Agent", browserUserAgent())
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -1281,38 +1301,35 @@ func (p *PanlianPlugin) doJSONGET(client *http.Client, cookie string, path strin
 
 		resp, err := client.Do(req)
 		if err != nil {
-			cancel()
-			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
-			continue
+			return err
 		}
-
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 		resp.Body.Close()
-		cancel()
 		if readErr != nil {
-			lastErr = readErr
-			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
-			continue
+			return readErr
 		}
 		if resp.StatusCode != http.StatusOK {
 			if resp.StatusCode == http.StatusUnauthorized || bytes.Contains(bytes.ToLower(body), []byte("请先登录")) || bytes.Contains(bytes.ToLower(body), []byte("admin_auth_required")) {
-				return fmt.Errorf("%w: HTTP %d", errLoginRequired, resp.StatusCode)
+				return util.Abort(fmt.Errorf("%w: HTTP %d", errLoginRequired, resp.StatusCode))
 			}
-			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
-			continue
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 		if err := json.Unmarshal(body, out); err != nil {
 			if bytes.Contains(body, []byte("请先登录")) || bytes.Contains(body, []byte("login")) {
-				return fmt.Errorf("%w: %s", errLoginRequired, string(body))
+				return util.Abort(fmt.Errorf("%w: %s", errLoginRequired, string(body)))
 			}
-			return fmt.Errorf("解析接口响应失败: %w", err)
+			return util.Abort(fmt.Errorf("解析接口响应失败: %w", err))
 		}
+		ok = true
 		return nil
+	})
+	if err != nil {
+		return err
 	}
-
-	return lastErr
+	if !ok {
+		return fmt.Errorf("请求未成功")
+	}
+	return nil
 }
 
 func (p *PanlianPlugin) doJSONPOST(client *http.Client, cookie string, path string, payload []byte, out interface{}) error {
@@ -1383,7 +1400,7 @@ func (p *PanlianPlugin) doLogin(username string, password string, remember bool)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	cancel()
 	if err != nil {
 		return "", nil, err
@@ -1422,7 +1439,7 @@ func (p *PanlianPlugin) reloginUser(user *User) error {
 	if err != nil {
 		user.Status = "expired"
 		user.Cookie = ""
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 		return err
 	}
 
@@ -1484,10 +1501,10 @@ func (p *PanlianPlugin) handleGetStatus(c *gin.Context, hash string) {
 			CreatedAt:    time.Now(),
 			LastAccessAt: time.Now(),
 		}
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 	} else {
 		user.LastAccessAt = time.Now()
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 	}
 
 	loggedIn := user.Status == "active" && user.Cookie != ""
@@ -2169,4 +2186,16 @@ func (p *PanlianPlugin) decryptPassword(encrypted string) (string, error) {
 		return "", err
 	}
 	return string(plaintext), nil
+}
+
+// saveUserOrLog 保存用户状态，失败时记录下来。
+//
+// 原先这几处都是 _ = p.saveUser(user)：内存状态已经更新，当前进程一切正常，
+// 但持久化失败时更改会在重启后丢失——新登录的用户会变回 pending、relogin 拿到的
+// cookie 会消失——而且没有任何线索。搜索本身已经成功，没法把错误回传给调用方，
+// 所以至少要让它在日志里可见。
+func (p *PanlianPlugin) saveUserOrLog(user *User) {
+	if err := p.saveUser(user); err != nil {
+		fmt.Printf("[PANLIAN] 保存用户状态失败（重启后可能丢失登录态）: %v\n", err)
+	}
 }
